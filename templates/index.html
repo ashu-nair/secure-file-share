@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure File Transfer</title>
+</head>
+<body style="font-family: Arial, sans-serif; padding: 20px;">
+    
+    <h1>Secure File Cloud</h1>
+    <hr>
+
+    <div style="border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; border-radius: 8px;">
+        <h2>1. Upload and Encrypt File</h2>
+        <form method="POST" enctype="multipart/form-data" action="/upload">
+            <label for="file">Choose File:</label>
+            <input type="file" name="file" id="file" required 
+                   style="padding: 5px; border: 1px solid #ddd; border-radius: 4px;">
+            <input type="submit" value="Upload & Index File" 
+                   style="padding: 8px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">
+        </form>
+    </div>
+
+    <div style="border: 1px solid #ccc; padding: 15px; border-radius: 8px;">
+        <h2>2. Decrypt and Download Files (Indexed)</h2>
+        {% if files %}
+            <p>Files stored securely ({{ files | length }} total):</p>
+            <ul style="list-style: none; padding: 0;">
+                {% for file in files %}
+                    <li style="margin-bottom: 10px; padding: 10px; background-color: #f4f4f4; border-radius: 4px; display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-weight: bold;">{{ file.original_filename }}</span>
+                        <!-- THIS IS THE NEW WORKING DOWNLOAD LINK -->
+                        <a href="/download/{{ file.id }}" 
+                           style="padding: 5px 10px; background-color: #28a745; color: white; text-decoration: none; border-radius: 4px;">
+                            Download
+                        </a>
+                    </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <p>No files have been indexed yet. Please upload a file.</p>
+        {% endif %}
+    </div>
+
+</body>
+</html>
