@@ -4,11 +4,33 @@ import io
 import json
 import time 
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from cryptography.fernet import Fernet 
 import boto3
 import sqlite3 # New: Import SQLite
 from contextlib import contextmanager # New: Helper for database connection
 import getpass
+import secrets
+from datetime import datetime, timedelta
+
+ENCRYPTION_KEY_FILE = "encryption.key"
+
+def load_or_create_encryption_key():
+    global ENCRYPTION_KEY, CIPHER
+    # try env first
+    env_key = os.getenv("ENCRYPTION_KEY")
+    if env_key:
+        ENCRYPTION_KEY = env_key.encode()
+    elif os.path.exists(ENCRYPTION_KEY_FILE):
+        ENCRYPTION_KEY = open(ENCRYPTION_KEY_FILE, "rb").read().strip()
+    else:
+        ENCRYPTION_KEY = Fernet.generate_key()
+        with open(ENCRYPTION_KEY_FILE, "wb") as f:
+            f.write(ENCRYPTION_KEY)
+    CIPHER = Fernet(ENCRYPTION_KEY)
+    print("🔑 Using encryption key from", "ENV" if env_key else ENCRYPTION_KEY_FILE)
+
 
 # --- 1. AWS S3 Configuration (Existing) ---
 AWS_ACCESS_KEY_ID = None
@@ -21,45 +43,41 @@ ENCRYPTION_KEY = None
 CIPHER = None
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
+
 
 def initialize_app_secrets():
-    """Initialize application secrets from environment or user input."""
-    global AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, AWS_REGION
+    """Initialize application secrets from environment variables."""
+    global AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, AWS_REGION, s3_client
+
     AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
-    if not AWS_ACCESS_KEY_ID:
-        print("--- AWS Configuration Required ---\n\n")
-        AWS_ACCESS_KEY_ID = input("Enter AWS Access Key ID: ")
-
     AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
-    if not AWS_SECRET_ACCESS_KEY:
-        # Use getpass.getpass() to securely read the secret key without displaying it
-        AWS_SECRET_ACCESS_KEY = getpass.getpass("Enter AWS Secret Access Key: ")
-
     S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
-    if not S3_BUCKET_NAME:
-        S3_BUCKET_NAME = input("Enter S3 Bucket Name: ")
-
     AWS_REGION = os.getenv('AWS_REGION')
-    if not AWS_REGION:
-        AWS_REGION = input("Enter AWS Region (e.g., us-east-1): ")
+
+    # Validation
+    if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, AWS_REGION]):
+        print("⚠️  Missing required AWS configuration. Please set these environment variables:")
+        print("   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, AWS_REGION")
+        exit(1)
 
     try:
-        s3_client = boto3.client(...)
-        s3_client.head_bucket(Bucket=S3_BUCKET_NAME) # <--- THIS VALIDATES THE CONNECTION
-        print(f"☁️ AWS S3 Client Initialized and connected to '{S3_BUCKET_NAME}'.")
-
+        # Initialize S3 client
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+        s3_client.head_bucket(Bucket=S3_BUCKET_NAME)
+        print(f"☁️  AWS S3 Client Initialized and connected to '{S3_BUCKET_NAME}'.")
     except Exception as e:
         s3_client = None
-        print(f"⚠️ Warning: Could not initialize S3 client. Uploads/Downloads will fail. Error: {e}")
+        print(f"⚠️  Warning: Could not initialize S3 client. Uploads/Downloads may fail. Error: {e}")
 
-    # --- 2. Encryption Setup (Existing) ---
-    ENCRYPTION_KEY = Fernet.generate_key()
-    CIPHER = Fernet(ENCRYPTION_KEY)
-    print(f"🔑 Encryption Key: {ENCRYPTION_KEY.decode()}")
+    # Initialize encryption key
+    load_or_create_encryption_key()
 
-    # FILE_DATABASE = {} # Removed: Replaced with SQLite
-
-    app.config['S3_BUCKET_NAME'] = S3_BUCKET_NAME
 
 # --- 3. SQLite Persistence Setup (New) ---
 
@@ -74,8 +92,17 @@ def get_db_connection():
         conn.close()
 
 def init_db():
-    """Initializes the database and creates the files table if it doesn't exist."""
     with get_db_connection() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS shared_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            expires_at REAL NOT NULL,
+            FOREIGN KEY(file_id) REFERENCES files(id)
+         );
+""")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id TEXT PRIMARY KEY,
@@ -85,32 +112,93 @@ def init_db():
                 owner_id TEXT DEFAULT 'anonymous'
             );
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL
+            );
+        """)
         conn.commit()
     print(f"💾 SQLite Database '{DATABASE_FILE}' initialized and ready.")
+
 
 # Initialize the database when the application starts
 with app.app_context():
     init_db()
+# Flask-Login setup
+login_manager = LoginManager()
+login_manager.login_view = "login"
+login_manager.init_app(app)
+
+class User(UserMixin):
+    def __init__(self, id, username, password_hash):
+        self.id = id
+        self.username = username
+        self.password_hash = password_hash
+
+@login_manager.user_loader
+def load_user(user_id):
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row:
+            return User(row["id"], row["username"], row["password_hash"])
+    return None
 
 # --- 4. Flask Routes Updated for Persistence ---
 
 @app.route('/')
+@login_required
 def index():
     # Fetch file metadata from the database instead of in-memory dictionary
     with get_db_connection() as conn:
-        # Order by uploaded_at descending
-        files_cursor = conn.execute("SELECT * FROM files ORDER BY uploaded_at DESC").fetchall()
-        # Convert sqlite.Row objects to dictionary list
-        files_metadata = [dict(row) for row in files_cursor] 
-
-    print("\n--- CURRENT FILE DATABASE CONTENTS (METADATA) ---")
-    print(json.dumps(files_metadata, indent=4))
-    print("--------------------------------------------------\n")
-
-    # The HTML template will now receive data from the persistent database
+        files_cursor = conn.execute(
+            "SELECT * FROM files WHERE owner_id = ? ORDER BY uploaded_at DESC",
+            (current_user.username,)
+        ).fetchall()
+    files_metadata = [dict(row) for row in files_cursor]
     return render_template('index.html', files=files_metadata)
 
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        if not username or not password:
+            return "Missing username/password", 400
+        password_hash = generate_password_hash(password)
+        try:
+            with get_db_connection() as conn:
+                conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                             (username, password_hash))
+                conn.commit()
+            return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            return "Username already exists", 400
+    return render_template("signup.html")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        with get_db_connection() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if row and check_password_hash(row["password_hash"], password):
+            user = User(row["id"], row["username"], row["password_hash"])
+            login_user(user)
+            return redirect(url_for("index"))
+        return "Invalid username or password", 401
+    return render_template("login.html")
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload_file():
     if s3_client is None:
         return "S3 Client initialization failed. Cannot upload.", 503
@@ -149,9 +237,9 @@ def upload_file():
         try:
             with get_db_connection() as conn:
                 conn.execute("""
-                    INSERT INTO files (id, original_filename, disk_name, uploaded_at)
-                    VALUES (?, ?, ?, ?)
-                """, (unique_file_id, original_filename, s3_key, time.time()))
+                    INSERT INTO files (id, original_filename, disk_name, uploaded_at, owner_id)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (unique_file_id, original_filename, s3_key, time.time(), current_user.username))
                 conn.commit()
         except Exception as e:
              # Important: Log and potentially delete the S3 file if metadata save fails
@@ -162,6 +250,7 @@ def upload_file():
         return redirect(url_for('index'))
     
 @app.route('/download/<file_id>', methods=['GET'])
+@login_required
 def download_file(file_id):
     if s3_client is None:
         return "S3 Client initialization failed. Cannot download.", 503
@@ -175,6 +264,9 @@ def download_file(file_id):
     
     # Convert Row object to dictionary for consistent access
     file_metadata = dict(file_metadata)
+
+    if file_metadata.get("owner_id") != current_user.username:
+        return "Unauthorized access to this file.", 403
     
     s3_key = file_metadata['disk_name']
     original_filename = file_metadata['original_filename']
@@ -200,10 +292,66 @@ def download_file(file_id):
         # Catch decryption errors, S3 errors, etc.
         print(f"Error during file download/decryption: {e}")
         return f"An unexpected error occurred during S3 or file handling: {e}", 500
+    
+@app.route("/share/<file_id>", methods=["POST"])
+@login_required
+def share_file(file_id):
+    # Get duration from form (in minutes)
+    duration = int(request.form.get("duration", 10))  # default 10 minutes
+
+    with get_db_connection() as conn:
+        file_metadata = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+        if not file_metadata:
+            return "❌ File not found.", 404
+
+        if file_metadata["owner_id"] != current_user.username:
+            return "🚫 Unauthorized access.", 403
+
+        # Generate unique token + expiry time
+        token = secrets.token_urlsafe(16)
+        expires_at = time.time() + (duration * 60)
+
+        # Save to shared_links table
+        conn.execute(
+            "INSERT INTO shared_links (file_id, token, expires_at) VALUES (?, ?, ?)",
+            (file_id, token, expires_at)
+        )
+        conn.commit()
+
+    # Generate full link (e.g., http://127.0.0.1:5000/shared/abc123)
+    share_link = url_for("shared_download", token=token, _external=True)
+    return f"✅ Shareable link (valid for {duration} minutes): {share_link}"
+
+@app.route("/shared/<token>")
+def shared_download(token):
+    with get_db_connection() as conn:
+        shared_row = conn.execute("SELECT * FROM shared_links WHERE token = ?", (token,)).fetchone()
+        if not shared_row:
+            return "❌ Invalid or expired link.", 404
+        if time.time() > shared_row["expires_at"]:
+            conn.execute("DELETE FROM shared_links WHERE token = ?", (token,))
+            conn.commit()
+            return "⏰ This link has expired.", 403
+        file_row = conn.execute("SELECT * FROM files WHERE id = ?", (shared_row["file_id"],)).fetchone()
+
+    # Download encrypted file from S3
+    s3_obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_row["disk_name"])
+    encrypted_data = s3_obj["Body"].read()
+
+    # Decrypt
+    decrypted_data = CIPHER.decrypt(encrypted_data)
+
+    # Send decrypted file
+    return send_file(
+        io.BytesIO(decrypted_data),
+        as_attachment=True,
+        download_name=file_row["original_filename"]
+    )
 
 if __name__ == '__main__':
     initialize_app_secrets()
     app.config['S3_BUCKET_NAME'] = S3_BUCKET_NAME 
     with app.app_context():
          init_db()
-    app.run(debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+
