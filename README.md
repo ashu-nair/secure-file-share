@@ -127,7 +127,7 @@ docker run -d -p 80:5000 --env-file .env secure-file-sharing
 ```
 Access your live app at:
 
-http://<ec2-public-ip>/
+http://ec2-public-ip/
 
 🧠 Future Enhancements
 🔑 Integrate AWS KMS for key management
