@@ -13,6 +13,9 @@ from contextlib import contextmanager # New: Helper for database connection
 import getpass
 import secrets
 from datetime import datetime, timedelta
+from flask import flash
+import subprocess
+import tempfile
 
 ENCRYPTION_KEY_FILE = "encryption.key"
 
@@ -206,6 +209,33 @@ def logout():
     logout_user()
     return redirect(url_for("login"))
 
+def scan_file_safe(file_data):
+    """Fast, safe file scan using ClamAV."""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+
+        # Run scan (quiet mode)
+        result = subprocess.run(
+            ["clamscan", "--no-summary", tmp_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        output = result.stdout.decode()
+
+        os.remove(tmp_path)
+
+        # Detect infection
+        if "FOUND" in output:
+            print(f"⚠️ Malware detected: {output}")
+            return False
+        else:
+            return True
+    except Exception as e:
+        # If ClamAV isn't installed or fails, skip scanning
+        print(f"⚠️ ClamAV scan skipped (error: {e})")
+        return True
+
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_file():
@@ -225,6 +255,10 @@ def upload_file():
         s3_key = unique_file_id + ".enc"
         
         file_data = file.read()
+
+        if not scan_file_safe(file_data):
+            return "⚠️ Upload rejected: file contains a virus!", 400
+
 
         try:
             encrypted_data = CIPHER.encrypt(file_data)
@@ -329,7 +363,8 @@ def share_file(file_id):
 
     # Generate full link (e.g., http://127.0.0.1:5000/shared/abc123)
     share_link = url_for("shared_download", token=token, _external=True)
-    return f"✅ Shareable link (valid for {duration} minutes): {share_link}"
+    flash(f"✅ Shareable link (valid for {duration} minutes): {share_link}", "success")
+    return redirect(url_for('index'))
 
 @app.route("/shared/<token>")
 def shared_download(token):
