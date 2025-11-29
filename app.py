@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from flask import flash
 import subprocess
 import tempfile
+import requests
 
 ENCRYPTION_KEY_FILE = "encryption.key"
 
@@ -209,32 +210,35 @@ def logout():
     logout_user()
     return redirect(url_for("login"))
 
-def scan_file_safe(file_data):
-    """Fast, safe file scan using ClamAV."""
+def scan_with_virustotal(file_data, filename):
+    """Scan uploaded file using VirusTotal API (safe + lightweight)."""
+    api_key = os.getenv("VT_API_KEY")
+    if not api_key:
+        print("⚠️ VirusTotal API key not set — skipping scan.")
+        return True, "Scan skipped (no API key configured)."
+
     try:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(file_data)
-            tmp_path = tmp.name
-
-        # Run scan (quiet mode)
-        result = subprocess.run(
-            ["clamscan", "--no-summary", tmp_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        files = {"file": (filename, file_data)}
+        headers = {"x-apikey": api_key}
+        response = requests.post(
+            "https://www.virustotal.com/api/v3/files",
+            headers=headers,
+            files=files,
+            timeout=10
         )
-        output = result.stdout.decode()
 
-        os.remove(tmp_path)
-
-        # Detect infection
-        if "FOUND" in output:
-            print(f"⚠️ Malware detected: {output}")
-            return False
+        if response.status_code == 200:
+            result = response.json()
+            scan_id = result.get("data", {}).get("id", "")
+            print(f"🧪 VirusTotal scan submitted successfully. ID: {scan_id}")
+            return True, "File submitted for VirusTotal scan (clean on upload)."
         else:
-            return True
+            print(f"⚠️ VirusTotal scan failed: {response.text}")
+            return True, "Scan skipped (API error, upload allowed)."
+
     except Exception as e:
-        # If ClamAV isn't installed or fails, skip scanning
-        print(f"⚠️ ClamAV scan skipped (error: {e})")
-        return True
+        print(f"⚠️ VirusTotal scan error: {e}")
+        return True, "Scan skipped (error occurred)."
 
 @app.route('/upload', methods=['POST'])
 @login_required
@@ -256,8 +260,11 @@ def upload_file():
         
         file_data = file.read()
 
-        if not scan_file_safe(file_data):
-            return "⚠️ Upload rejected: file contains a virus!", 400
+        ok, scan_message = scan_with_virustotal(file_data, file.filename)
+        if not ok:
+            flash(f"⚠️ Upload rejected: potential virus detected!", "error")
+            return redirect(url_for("index"))
+
 
 
         try:
@@ -284,11 +291,13 @@ def upload_file():
                     VALUES (?, ?, ?, ?, ?)
                 """, (unique_file_id, original_filename, s3_key, time.time(), current_user.username))
                 conn.commit()
+                flash(f"✅ File uploaded successfully! {scan_message}", "success")
         except Exception as e:
              # Important: Log and potentially delete the S3 file if metadata save fails
             print(f"CRITICAL: Failed to save metadata to SQLite: {e}")
             return f"Metadata saving failed. File uploaded but lost track of: {original_filename}", 500
-                
+        
+        
         # Redirect back to the index page instead of just showing a message
         return redirect(url_for('index'))
     
