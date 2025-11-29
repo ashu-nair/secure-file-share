@@ -1,3 +1,5 @@
 .env
 encryption.key
 file_metadata.db
+secure-deploy-key
+secure-deploy-key.pub
