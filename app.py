@@ -137,6 +137,15 @@ class User(UserMixin):
         self.username = username
         self.password_hash = password_hash
 
+@app.template_filter('datetime')
+def format_datetime(value):
+    """Convert a timestamp (float or int) to readable date string."""
+    try:
+        dt = datetime.fromtimestamp(float(value))
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return "N/A"
+
 @login_manager.user_loader
 def load_user(user_id):
     with get_db_connection() as conn:
