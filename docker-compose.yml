@@ -12,3 +12,5 @@ services:
     volumes:
       - ./.env:/app/.env
       - ./file_metadata.db:/app/file_metadata.db
+    command: >
+      bash -c "touch /app/file_metadata.db && chmod 666 /app/file_metadata.db && python app.py"
