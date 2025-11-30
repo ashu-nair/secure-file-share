@@ -211,34 +211,44 @@ def logout():
     return redirect(url_for("login"))
 
 def scan_with_virustotal(file_data, filename):
-    """Scan uploaded file using VirusTotal API (safe + lightweight)."""
-    api_key = os.getenv("VT_API_KEY")
+    """Scan file with VirusTotal API and return (is_clean, message)."""
+    api_key = os.getenv("VIRUSTOTAL_API_KEY")
     if not api_key:
-        print("⚠️ VirusTotal API key not set — skipping scan.")
+        print("⚠️ VirusTotal API key not configured — skipping scan.")
         return True, "Scan skipped (no API key configured)."
 
+    vt_url = "https://www.virustotal.com/api/v3/files"
+    headers = {"x-apikey": api_key}
+
     try:
+        # Step 1: upload file for analysis
         files = {"file": (filename, file_data)}
-        headers = {"x-apikey": api_key}
-        response = requests.post(
-            "https://www.virustotal.com/api/v3/files",
-            headers=headers,
-            files=files,
-            timeout=10
-        )
+        resp = requests.post(vt_url, headers=headers, files=files)
+        resp.raise_for_status()
+        analysis_id = resp.json()["data"]["id"]
+        print(f"🧪 Submitted to VirusTotal: analysis_id={analysis_id}")
 
-        if response.status_code == 200:
-            result = response.json()
-            scan_id = result.get("data", {}).get("id", "")
-            print(f"🧪 VirusTotal scan submitted successfully. ID: {scan_id}")
-            return True, "File submitted for VirusTotal scan (clean on upload)."
-        else:
-            print(f"⚠️ VirusTotal scan failed: {response.text}")
-            return True, "Scan skipped (API error, upload allowed)."
-
+        # Step 2: poll for results
+        for _ in range(15):  # wait up to ~15 seconds
+            time.sleep(2)
+            res = requests.get(
+                f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+                headers=headers
+            )
+            res_json = res.json()
+            status = res_json["data"]["attributes"]["status"]
+            if status == "completed":
+                stats = res_json["data"]["attributes"]["stats"]
+                malicious = stats.get("malicious", 0)
+                suspicious = stats.get("suspicious", 0)
+                if malicious > 0 or suspicious > 0:
+                    return False, f"⚠️ Virus detected by {malicious + suspicious} engines."
+                else:
+                    return True, "File submitted for VirusTotal scan (clean on upload)."
+        return True, "Scan timeout: file uploaded, result pending."
     except Exception as e:
         print(f"⚠️ VirusTotal scan error: {e}")
-        return True, "Scan skipped (error occurred)."
+        return True, "Scan skipped due to API error."
 
 @app.route('/upload', methods=['POST'])
 @login_required
