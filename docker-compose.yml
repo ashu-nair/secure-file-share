@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  web:
+    build: .
+    container_name: secure-file-share
+    ports:
+      - "5000:5000"
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env
+      - ./file_metadata.db:/app/file_metadata.db
