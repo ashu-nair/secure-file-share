@@ -212,10 +212,9 @@ def logout():
 
 def scan_with_virustotal(file_data, filename):
     """Scan file with VirusTotal API and return (is_clean, message)."""
-    api_key = os.getenv("VIRUSTOTAL_API_KEY")
-    if not api_key:
-        print("⚠️ VirusTotal API key not configured — skipping scan.")
-        return True, "Scan skipped (no API key configured)."
+    api_key = os.getenv("VT_API_KEY") or os.environ.get("VT_API_KEY")
+    print("🧩 Debug: VT_API_KEY loaded?", bool(api_key))
+
 
     vt_url = "https://www.virustotal.com/api/v3/files"
     headers = {"x-apikey": api_key}
