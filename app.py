@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for
 import os
 import io
-import json
+
 import time 
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -10,12 +10,10 @@ from cryptography.fernet import Fernet
 import boto3
 import sqlite3 # New: Import SQLite
 from contextlib import contextmanager # New: Helper for database connection
-import getpass
+
 import secrets
 from datetime import datetime, timedelta
 from flask import flash
-import subprocess
-import tempfile
 import requests
 
 ENCRYPTION_KEY_FILE = "encryption.key"
@@ -213,41 +211,42 @@ def logout():
 def scan_with_virustotal(file_data, filename):
     """Scan file with VirusTotal API and return (is_clean, message)."""
     api_key = os.getenv("VT_API_KEY") or os.environ.get("VT_API_KEY")
-    print("🧩 Debug: VT_API_KEY loaded?", bool(api_key))
-
+    if not api_key:
+        print("⚠️ No VirusTotal API key found — skipping scan.")
+        return True, "Scan skipped (no API key configured)."
 
     vt_url = "https://www.virustotal.com/api/v3/files"
     headers = {"x-apikey": api_key}
 
     try:
-        # Step 1: upload file for analysis
+        # 1️⃣ Upload file for scanning
         files = {"file": (filename, file_data)}
-        resp = requests.post(vt_url, headers=headers, files=files)
-        resp.raise_for_status()
-        analysis_id = resp.json()["data"]["id"]
-        print(f"🧪 Submitted to VirusTotal: analysis_id={analysis_id}")
+        response = requests.post(vt_url, headers=headers, files=files)
+        if response.status_code not in (200, 202):
+            return True, f"⚠️ VirusTotal error ({response.status_code}): {response.text}"
 
-        # Step 2: poll for results
-        for _ in range(15):  # wait up to ~15 seconds
-            time.sleep(2)
-            res = requests.get(
-                f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
-                headers=headers
-            )
-            res_json = res.json()
-            status = res_json["data"]["attributes"]["status"]
+        analysis_url = response.json()["data"]["links"]["self"]
+
+        # 2️⃣ Poll VirusTotal (up to ~10 seconds)
+        for _ in range(10):
+            analysis = requests.get(analysis_url, headers=headers).json()
+            status = analysis["data"]["attributes"]["status"]
+
             if status == "completed":
-                stats = res_json["data"]["attributes"]["stats"]
+                stats = analysis["data"]["attributes"]["stats"]
                 malicious = stats.get("malicious", 0)
-                suspicious = stats.get("suspicious", 0)
-                if malicious > 0 or suspicious > 0:
-                    return False, f"⚠️ Virus detected by {malicious + suspicious} engines."
+                if malicious > 0:
+                    return False, f"🚨 Detected: {malicious} engines flagged this file!"
                 else:
-                    return True, "File submitted for VirusTotal scan (clean on upload)."
-        return True, "Scan timeout: file uploaded, result pending."
+                    return True, "✅ File scanned and found clean."
+            time.sleep(1)
+
+        # If not finished in 10s
+        return True, "⚠️ VirusTotal scan timed out — result unavailable."
+
     except Exception as e:
-        print(f"⚠️ VirusTotal scan error: {e}")
-        return True, "Scan skipped due to API error."
+        print(f"Error scanning file with VirusTotal: {e}")
+        return True, f"⚠️ VirusTotal scan failed: {e}"
 
 @app.route('/upload', methods=['POST'])
 @login_required
