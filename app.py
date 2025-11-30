@@ -42,7 +42,7 @@ AWS_SECRET_ACCESS_KEY = None
 S3_BUCKET_NAME = None
 AWS_REGION = None
 s3_client = None
-DATABASE_FILE = 'file_metadata.db'
+DATABASE_FILE = '/app/data/file_metadata.db'
 ENCRYPTION_KEY = None
 CIPHER = None
 

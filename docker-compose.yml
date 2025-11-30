@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   web:
     build: .
@@ -11,6 +9,6 @@ services:
       - .env
     volumes:
       - ./.env:/app/.env
-      - ./file_metadata.db:/app/file_metadata.db
+      - ./data:/app/data   # this keeps your DB persistent between rebuilds
     command: >
-      bash -c "touch /app/file_metadata.db && chmod 666 /app/file_metadata.db && python app.py"
+      bash -c "mkdir -p /app/data && chmod -R 777 /app/data && python app.py"
