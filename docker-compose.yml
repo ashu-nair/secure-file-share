@@ -5,10 +5,16 @@ services:
     ports:
       - "5000:5000"
     restart: always
+
+    # Environment variables
     env_file:
-      - .env
+      - /home/ubuntu/secure-file-share-env
+
+    # Persistent volumes
     volumes:
-      - ./.env:/app/.env
-      - ./data:/app/data   # this keeps your DB persistent between rebuilds
+      - /home/ubuntu/secure-file-share-env:/app/.env:ro  # read-only for safety
+      - ./data:/app/data
+
     command: >
       bash -c "mkdir -p /app/data && chmod -R 777 /app/data && python app.py"
+
