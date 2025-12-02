@@ -455,7 +455,6 @@ def delete_file(file_id):
     if s3_client is None:
         return "S3 Client initialization failed. Cannot delete.", 503
 
-    # Fetch metadata
     with get_db_connection() as conn:
         row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
 
@@ -469,7 +468,7 @@ def delete_file(file_id):
 
     s3_key = row["disk_name"]
 
-    # 1️⃣ Delete from S3 safely
+    # delete from S3
     try:
         s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
     except Exception as e:
@@ -477,16 +476,13 @@ def delete_file(file_id):
         flash("⚠️ Could not delete file from storage.", "error")
         return redirect(url_for("index"))
 
-    # 2️⃣ Delete metadata + shared links
-    try:
-        with get_db_connection() as conn:
-            conn.execute("DELETE FROM shared_links WHERE file_id = ?", (file_id,))
-            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
-            conn.commit()
-        flash("🗑️ File deleted successfully.", "success")
-    except Exception as e:
-        print(f"Error deleting database metadata: {e}")
-        flash("⚠️ File removed from S3 but metadata deletion failed.", "error")
+    # delete metadata + share links
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM shared_links WHERE file_id = ?", (file_id,))
+        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        conn.commit()
 
+    flash("🗑️ File deleted successfully.", "success")
     return redirect(url_for("index"))
+
 
