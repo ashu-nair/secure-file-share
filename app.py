@@ -10,7 +10,7 @@ from cryptography.fernet import Fernet
 import boto3
 import sqlite3 # New: Import SQLite
 from contextlib import contextmanager # New: Helper for database connection
-
+import threading
 import secrets
 from datetime import datetime, timedelta
 from flask import flash
@@ -209,8 +209,9 @@ def logout():
     return redirect(url_for("login"))
 
 def scan_with_virustotal(file_data, filename):
-    """Scan file with VirusTotal API and return (is_clean, message)."""
+    """Optimized VirusTotal scanning with better polling + timeout handling."""
     api_key = os.getenv("VT_API_KEY") or os.environ.get("VT_API_KEY")
+
     if not api_key:
         print("⚠️ No VirusTotal API key found — skipping scan.")
         return True, "Scan skipped (no API key configured)."
@@ -219,69 +220,106 @@ def scan_with_virustotal(file_data, filename):
     headers = {"x-apikey": api_key}
 
     try:
-        # 1️⃣ Upload file for scanning
+        # Step 1: Upload file for scanning
         files = {"file": (filename, file_data)}
         response = requests.post(vt_url, headers=headers, files=files)
+
         if response.status_code not in (200, 202):
             return True, f"⚠️ VirusTotal error ({response.status_code}): {response.text}"
 
         analysis_url = response.json()["data"]["links"]["self"]
 
-        # 2️⃣ Poll VirusTotal (up to ~10 seconds)
-        for _ in range(10):
+        # Step 2: Poll for results
+        max_wait_seconds = 45   # free tier needs more time
+        poll_interval = 2       # check every 2 sec
+        waited = 0
+
+        while waited < max_wait_seconds:
             analysis = requests.get(analysis_url, headers=headers).json()
             status = analysis["data"]["attributes"]["status"]
 
             if status == "completed":
                 stats = analysis["data"]["attributes"]["stats"]
                 malicious = stats.get("malicious", 0)
-                if malicious > 0:
-                    return False, f"🚨 Detected: {malicious} engines flagged this file!"
-                else:
-                    return True, "✅ File scanned and found clean."
-            time.sleep(1)
 
-        # If not finished in 10s
-        return True, "⚠️ VirusTotal scan timed out — result unavailable."
+                if malicious > 0:
+                    return False, f"🚨 VirusTotal detected: {malicious} engines flagged this file!"
+                return True, "✅ Virus scan complete — file is clean."
+
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+        # If not completed within allowed time
+        return True, "⚠️ VirusTotal scan took too long; upload allowed but results unavailable."
 
     except Exception as e:
-        print(f"Error scanning file with VirusTotal: {e}")
-        return True, f"⚠️ VirusTotal scan failed: {e}"
+        print(f"[VirusTotal Error] {e}")
+        return True, f"⚠️ Scan failed — {e}"
+
+def background_virus_scan(file_id, file_data, filename, owner):
+    """Runs VirusTotal scan in background after upload."""
+    ok, msg = scan_with_virustotal(file_data, filename)
+
+    if ok:
+        print(f"[VT-CLEAN] {filename} → {msg}")
+        return
+
+    # If malicious → delete file from S3 + DB
+    print(f"[VT-DETECTED] {filename} — removing file!")
+
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+
+    if not row:
+        return
+
+    s3_key = row["disk_name"]
+
+    # delete from S3
+    try:
+        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+    except:
+        pass
+
+    # delete from DB
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM shared_links WHERE file_id = ?", (file_id,))
+        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        conn.commit()
+
+    print(f"[VT-DELETED] {filename} removed due to virus detection.")
 
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_file():
     if s3_client is None:
         return "S3 Client initialization failed. Cannot upload.", 503
-        
-    if 'file' not in request.files:
-        return 'No file part', 400
-    file = request.files['file']
-    
-    if file.filename == '':
-        return 'No selected file', 400
 
-    if file:
+    # multiple files
+    files = request.files.getlist("files")
+
+    if not files or files[0].filename == "":
+        flash("No files selected.", "error")
+        return redirect(url_for("index"))
+
+    for file in files:
         original_filename = secure_filename(file.filename)
-        unique_file_id = str(time.time()).replace('.', '') 
+        unique_file_id = str(time.time()).replace('.', '') + secrets.token_hex(4)
         s3_key = unique_file_id + ".enc"
-        
+
         file_data = file.read()
 
-        ok, scan_message = scan_with_virustotal(file_data, file.filename)
-        if not ok:
-            flash(f"⚠️ Upload rejected: potential virus detected!", "error")
-            return redirect(url_for("index"))
+        # Start background VT scan (non-blocking)
+        threading.Thread(
+            target=background_virus_scan,
+            args=(unique_file_id, file_data, original_filename, current_user.username)
+        ).start()
 
-
-
-        try:
-            encrypted_data = CIPHER.encrypt(file_data)
-        except Exception as e:
-            return f"Encryption failed: {e}", 500
-
+        # Encrypt file
+        encrypted_data = CIPHER.encrypt(file_data)
         encrypted_buffer = io.BytesIO(encrypted_data)
-        
+
+        # Upload to S3
         try:
             s3_client.upload_fileobj(
                 encrypted_buffer,
@@ -289,25 +327,20 @@ def upload_file():
                 s3_key
             )
         except Exception as e:
-            return f"S3 Upload failed: {e}", 500
+            flash(f"S3 upload failed for {original_filename}: {e}", "error")
+            continue
 
-        # NEW: Save metadata to SQLite instead of in-memory dictionary
-        try:
-            with get_db_connection() as conn:
-                conn.execute("""
-                    INSERT INTO files (id, original_filename, disk_name, uploaded_at, owner_id)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (unique_file_id, original_filename, s3_key, time.time(), current_user.username))
-                conn.commit()
-                flash(f"✅ File uploaded successfully! {scan_message}", "success")
-        except Exception as e:
-             # Important: Log and potentially delete the S3 file if metadata save fails
-            print(f"CRITICAL: Failed to save metadata to SQLite: {e}")
-            return f"Metadata saving failed. File uploaded but lost track of: {original_filename}", 500
-        
-        
-        # Redirect back to the index page instead of just showing a message
-        return redirect(url_for('index'))
+        # Save metadata
+        with get_db_connection() as conn:
+            conn.execute("""
+                INSERT INTO files (id, original_filename, disk_name, uploaded_at, owner_id)
+                VALUES (?, ?, ?, ?, ?)
+            """, (unique_file_id, original_filename, s3_key, time.time(), current_user.username))
+            conn.commit()
+
+    flash("✅ All files uploaded! Virus scan running in background.", "success")
+    return redirect(url_for('index'))
+
     
 @app.route('/download/<file_id>', methods=['GET'])
 @login_required
@@ -416,3 +449,43 @@ if __name__ == '__main__':
          init_db()
     app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
 
+@app.route('/delete/<file_id>', methods=['POST'])
+@login_required
+def delete_file(file_id):
+    if s3_client is None:
+        return "S3 Client initialization failed. Cannot delete.", 503
+
+    # Fetch metadata
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+
+    if not row:
+        flash("❌ File not found.", "error")
+        return redirect(url_for("index"))
+
+    if row["owner_id"] != current_user.username:
+        flash("🚫 Unauthorized action.", "error")
+        return redirect(url_for("index"))
+
+    s3_key = row["disk_name"]
+
+    # 1️⃣ Delete from S3 safely
+    try:
+        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+    except Exception as e:
+        print(f"Error deleting S3 object: {e}")
+        flash("⚠️ Could not delete file from storage.", "error")
+        return redirect(url_for("index"))
+
+    # 2️⃣ Delete metadata + shared links
+    try:
+        with get_db_connection() as conn:
+            conn.execute("DELETE FROM shared_links WHERE file_id = ?", (file_id,))
+            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            conn.commit()
+        flash("🗑️ File deleted successfully.", "success")
+    except Exception as e:
+        print(f"Error deleting database metadata: {e}")
+        flash("⚠️ File removed from S3 but metadata deletion failed.", "error")
+
+    return redirect(url_for("index"))
