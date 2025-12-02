@@ -404,6 +404,7 @@ def share_file(file_id):
         token = secrets.token_urlsafe(16)
         expires_at = time.time() + (duration * 60)
 
+
         # Save to shared_links table
         conn.execute(
             "INSERT INTO shared_links (file_id, token, expires_at) VALUES (?, ?, ?)",
