@@ -489,3 +489,4 @@ def delete_file(file_id):
         flash("⚠️ File removed from S3 but metadata deletion failed.", "error")
 
     return redirect(url_for("index"))
+
